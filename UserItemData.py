@@ -49,6 +49,8 @@ class UserItemData:
                     continue
 
                 self.data.append((user_id, movie_id, rating, date_time))
+                #if user_id == 78 or user_id==533:
+                    #print((user_id, movie_id, rating, date_time))
 
     def nratings(self):
         return len(self.data)
