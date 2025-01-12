@@ -1,104 +1,118 @@
 import numpy as np
+import pandas as pd
 from collections import defaultdict
+from math import sqrt
 
 class ItemBasedPredictor:
     def __init__(self, min_values=0, threshold=0):
         self.min_values = min_values
         self.threshold = threshold
-        self.similarities = {}
-        self.movie_ratings = {}
+        self.user_item_matrix = None
+        self.user_item_matrix_centered = None
+        self.similarity_matrix = None
         self.global_avg = 0
-        self.testCounter = 0;
 
-    def fit(self, X):
-        self.movie_ratings = defaultdict(dict)  # {movie_id: {user_id: rating}}
-        for user_id, movie_id, rating, _ in X.data:
-            self.movie_ratings[movie_id][user_id] = rating
+    def fit(self, x):
+        if not hasattr(x, 'data'):
+            raise ValueError("Input object must have a 'data' attribute containing user, movie, and rating information.")
+
+        data_df = pd.DataFrame(x.data, columns=['userID', 'movieID', 'rating', 'dateTime'])
         
-        all_ratings = [rating for movie_ratings in self.movie_ratings.values() for rating in movie_ratings.values()]
+        all_ratings = [rating for _, _, rating, _ in x.data]
         self.global_avg = np.mean(all_ratings)
-        
-        movie_ids = list(self.movie_ratings.keys())
-        self.similarities = defaultdict(dict)
-        
-        for i, movie1 in enumerate(movie_ids):
-            for movie2 in movie_ids[i+1:]:
-                sim = self.similarity(movie1, movie2)
 
-                self.testCounter +=1
-                
-                if sim > 0:
-                    self.similarities[movie1][movie2] = sim
-                    self.similarities[movie2][movie1] = sim
-                    
+        self.user_item_matrix = data_df.pivot(index='userID', columns='movieID', values='rating')
+        
+        self.user_item_matrix_centered = self.user_item_matrix.sub(self.user_item_matrix.mean(axis=1), axis=0)
+
+        self.similarity_matrix = pd.DataFrame(index=self.user_item_matrix.columns, columns=self.user_item_matrix.columns, dtype=float)
+
+        print(f"Shape of user_item_matrix: {self.user_item_matrix.shape}")  # Izpis dimenzij matrike uporabniških ocen
+
+        for p1 in self.user_item_matrix.columns:
+            for p2 in self.user_item_matrix.columns:
+                if p1 == p2:
+                    self.similarity_matrix.at[p1, p2] = 1.0
+                elif pd.isnull(self.similarity_matrix.at[p1, p2]):
+                    sim = self.similarity(p1, p2)
+                    self.similarity_matrix.at[p1, p2] = sim
+                    self.similarity_matrix.at[p2, p1] = sim
+
+        print(f"Similarity matrix calculated.")
 
     def similarity(self, p1, p2):
-        # Pridobimo ocene obeh filmov
-        users_p1 = self.movie_ratings[p1]
-        users_p2 = self.movie_ratings[p2]
-        
-        # Seznam skupnih uporabnikov
-        common_users = set(users_p1.keys()).intersection(users_p2.keys())
-
-        if len(common_users) < self.min_values:
+        if p1 not in self.user_item_matrix.columns or p2 not in self.user_item_matrix.columns:
             return 0
 
-        # Pridobimo ocene za skupne uporabnike
-        ratings_p1 = np.array([users_p1[user] for user in common_users])
-        ratings_p2 = np.array([users_p2[user] for user in common_users])
+        p1_ratings = self.user_item_matrix_centered[p1]
+        p2_ratings = self.user_item_matrix_centered[p2]
 
-        # Povprečne ocene uporabnikov
-        avg_p1 = np.mean(ratings_p1)
-        avg_p2 = np.mean(ratings_p2)
+        common_items = p1_ratings.dropna().index.intersection(p2_ratings.dropna().index)
 
-        # Odštejemo povprečja, da "centriramo" ocene
-        centered_p1 = ratings_p1 - avg_p1
-        centered_p2 = ratings_p2 - avg_p2
+        if len(common_items) < self.min_values:
+            return 0
 
-        # Izračunamo števnik (dot produkt)
-        numerator = np.dot(centered_p1, centered_p2)
+        p1_common = p1_ratings.loc[common_items]
+        p2_common = p2_ratings.loc[common_items]
 
-        # Izračunamo imenovalec (norme)
-        denominator = np.sqrt(np.sum(centered_p1**2)) * np.sqrt(np.sum(centered_p2**2))
+        numerator = np.dot(p1_common, p2_common)
+        denominator = np.sqrt(np.dot(p1_common, p1_common)) * np.sqrt(np.dot(p2_common, p2_common))
 
         if denominator == 0:
             return 0
 
-        # Izračunamo popravljeno cosinusno podobnost
         sim = numerator / denominator
         return sim if sim >= self.threshold else 0
 
-
     def predict(self, user_id):
+        if user_id not in self.user_item_matrix.index:
+            print(f"UserID {user_id} not found in the user_item_matrix. Returning empty predictions.")
+            return {}
+
+        user_ratings = self.user_item_matrix.loc[user_id]
         predictions = {}
-        user_ratings = {movie_id: rating for movie_id, rating in self.movie_ratings.items() if user_id in rating}
 
-        for movie_id in self.movie_ratings.keys():
-            # already rated by user
-            if movie_id in user_ratings:
-                continue
-
-            weighted_sum = 0
-            sim_sum = 0
-
-            for rated_movie, user_rating in user_ratings.items():
-                if movie_id in self.similarities and rated_movie in self.similarities[movie_id]: # in both sim(1,2) and sim(2,1)
-                    sim = self.similarities[movie_id][rated_movie]
-                    weighted_sum += sim * user_rating
-                    sim_sum += abs(sim)
-
-            if sim_sum > 0:
-                predictions[movie_id] = weighted_sum / sim_sum
+        for movie_id in self.user_item_matrix.columns:
+            if not pd.isnull(user_ratings[movie_id]):
+                predictions[movie_id] = user_ratings[movie_id]
             else:
-                predictions[movie_id] = 0
+                numerator, denominator = 0, 0
+                for rated_movie_id, rating in user_ratings.dropna().items():
+                    sim = (
+                        self.similarity_matrix.at[movie_id, rated_movie_id]
+                        if movie_id in self.similarity_matrix.index and rated_movie_id in self.similarity_matrix.columns
+                        else 0
+                    )
+                    numerator += sim * rating
+                    denominator += sim
+
+                predictions[movie_id] = numerator / denominator if denominator != 0 else self.global_avg
 
         return predictions
-    
-    def get_top_most_similar_pairs(self, n=20):
-        #return self.testCounter
-        #return len(self.similarities.items())
-        sorted_similarities = sorted(
-            [(movie1, movie2, sim) for movie1, movie2_dict in self.similarities.items() for movie2, sim in movie2_dict.items()],
-            key=lambda x: x[2], reverse=True
-        )
-        return sorted_similarities[:n]
+
+    def print_top_20_similar_movies(self, md):
+        similar_pairs = []
+
+        for movie_id1 in self.similarity_matrix.columns:
+            for movie_id2 in self.similarity_matrix.columns:
+                if movie_id1 != movie_id2:
+                    sim = self.similarity_matrix.at[movie_id1, movie_id2]
+                    if sim > 0:
+                        similar_pairs.append((movie_id1, movie_id2, sim))
+
+        if len(similar_pairs) == 0:
+            print("No similar movies found.")
+
+        similar_pairs.sort(key=lambda x: x[2], reverse=True)
+
+        print(f"Top 20 Similar Movies:")
+        for i in range(min(20, len(similar_pairs))):
+            movie1, movie2, similarity = similar_pairs[i]
+            title1 = md.get_title(movie1)  # Pridobimo ime filma
+            title2 = md.get_title(movie2)
+            
+            if title1 is None or title2 is None:
+                print(f"Missing movie titles for movie IDs: {movie1}, {movie2}")
+                continue
+
+            print(f"Film1: {title1}, Film2: {title2}, podobnost: {similarity}")
